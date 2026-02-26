@@ -27,13 +27,13 @@ pip install websocket-client
 3. スクリプトを実行する
 
 ```bash
-python ds.py
+python beatmapview.py
 ```
 
 ウィンドウサイズを指定する場合：
 
 ```bash
-python ds.py --width 1600 --height 400
+python beatmapview.py --width 1600 --height 400
 ```
 
 | 操作 | 動作 |
@@ -78,7 +78,7 @@ osu! (ゲーム)
   └─ tosu (メモリリーダー)
        ├─ WebSocket /v2        → 譜面情報・ゲーム状態・Mod
        └─ WebSocket /v2/precise → currentTime (高頻度)
-            └─ ds.py (このツール)
+            └─ beatmapview.py (このツール)
                  ├─ .osu ファイルをローカルから直接パース
                  └─ tkinter Canvas にノーツを描画
 ```
