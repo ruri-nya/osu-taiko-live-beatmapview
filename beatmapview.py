@@ -8,12 +8,12 @@ import sys
 import json
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass, field
 from typing import Optional
 
 import bisect
-import websocket
+import pygame
+from websocket import WebSocketApp
 
 # ─── Mod ビットフラグ (osu! 標準) ──────────────────────
 MOD_DT = 1 << 6   # 64
@@ -168,6 +168,11 @@ class GameState:
     play_start_wall: float = 0.0
     play_start_game: int   = 0
 
+    # ウォールクロック補間用（precise受信時に更新）
+    interp_wall: float = 0.0   # precise を受け取った瞬間のwall時刻
+    interp_game: int   = 0     # precise を受け取った瞬間のgame時刻
+    interp_speed: float = 1.0  # speed_rate のコピー
+
     playing: bool = False
     prev_state: str = "Menu"
 
@@ -201,47 +206,41 @@ def on_message(ws, message):
                 print(f"[DEBUG] data['{key}'] = {json.dumps(data[key], ensure_ascii=False)[:300]}")
     # ────────────────────────────────────────────────────
 
-    with state.lock:
-        raw_state = data.get("state", {})
-        new_state_name = raw_state.get("name", state.state_name)
+    # lock なしで直接代入（GIL で安全、lock競合による描画詰まりを防ぐ）
+    raw_state      = data.get("state", {})
+    new_state_name = raw_state.get("name", state.state_name)
 
-        if new_state_name == "Playing" and state.prev_state != "Playing":
-            play_data = data.get("play", {})
-            mods_num = play_data.get("mods", {}).get("number", 0)
-            state.mods_number = mods_num
-            state.speed_rate  = mods_to_speed_rate(mods_num)
-            state.mod_label   = mods_to_label(mods_num)
+    if new_state_name == "Playing" and state.prev_state != "Playing":
+        play_data        = data.get("play", {})
+        mods_num         = play_data.get("mods", {}).get("number", 0)
+        state.mods_number = mods_num
+        state.speed_rate  = mods_to_speed_rate(mods_num)
+        state.mod_label   = mods_to_label(mods_num)
+        state.playing     = True
+        print(f"[BV] Play start! mods={state.mod_label or 'NoMod'} speed={state.speed_rate}x")
 
-            state.play_start_wall = time.perf_counter()
-            state.play_start_game = data.get("beatmap", {}).get("time", {}).get("live", 0)
-            state.playing = True
-            print(f"[BV] Play start! mods={state.mod_label or 'NoMod'} "
-                  f"speed={state.speed_rate}x game_time={state.play_start_game}ms")
+    if new_state_name != "Playing":
+        state.playing = False
 
-        if new_state_name != "Playing":
-            state.playing = False
+    state.prev_state = state.state_name
+    state.state_name = new_state_name
 
-        state.prev_state = state.state_name
-        state.state_name = new_state_name
+    beatmap_data = data.get("beatmap", {})
+    live_time    = beatmap_data.get("time", {}).get("live", None)
+    if live_time is not None:
+        state.game_time_ms = live_time
 
-        beatmap_data = data.get("beatmap", {})
-        live_time = beatmap_data.get("time", {}).get("live", None)
-        if live_time is not None:
-            state.game_time_ms = live_time
-        direct_path = data.get("directPath", {})
-        folders     = data.get("folders", {})
+    new_beatmap = data.get("directPath", {}).get("beatmapFile", "")
+    new_songs   = data.get("folders", {}).get("songs", "")
 
-        new_beatmap = direct_path.get("beatmapFile", "")
-        new_songs   = folders.get("songs", "")
+    if new_songs and new_songs != state.songs_folder:
+        state.songs_folder = new_songs
+        print(f"[WS] Songs folder: {new_songs}")
 
-        if new_songs and new_songs != state.songs_folder:
-            state.songs_folder = new_songs
-            print(f"[WS] Songs folder: {new_songs}")
-
-        if new_beatmap and new_beatmap != state.beatmap_path:
-            state.beatmap_path = new_beatmap
-            state.notes = []       # パスが変わったら再ロード要求
-            print(f"[WS] Beatmap changed: {new_beatmap}")
+    if new_beatmap and new_beatmap != state.beatmap_path:
+        state.beatmap_path = new_beatmap
+        state.notes = []
+        print(f"[WS] Beatmap changed: {new_beatmap}")
 
 
 def on_error(ws, error):
@@ -259,7 +258,7 @@ def on_open(ws):
 
 
 def start_ws():
-    ws = websocket.WebSocketApp(
+    ws = WebSocketApp(
         TOSU_WS_URL,
         on_open=on_open,
         on_message=on_message,
@@ -279,8 +278,11 @@ def on_precise_message(ws, message):
     t = data.get("currentTime")
     if t is None:
         return
-    with state.lock:
-        state.game_time_ms = t
+    # precise 受信時にウォールクロックをラッチして補間の基準にする
+    state.game_time_ms = t
+    state.interp_game  = t
+    state.interp_wall  = time.perf_counter()
+    state.interp_speed = state.speed_rate
 
 
 def on_precise_close(ws, code, msg):
@@ -289,7 +291,7 @@ def on_precise_close(ws, code, msg):
 
 
 def start_precise_ws():
-    ws = websocket.WebSocketApp(
+    ws = WebSocketApp(
         TOSU_WS_PRECISE,
         on_message=on_precise_message,
         on_error=lambda ws, e: None,
@@ -303,10 +305,9 @@ def start_precise_ws():
 def beatmap_loader_thread():
     while True:
         time.sleep(0.3)
-        with state.lock:
-            current_rel  = state.beatmap_path
-            songs_folder = state.songs_folder
-            already      = state.loaded_beatmap_path
+        current_rel  = state.beatmap_path
+        songs_folder = state.songs_folder
+        already      = state.loaded_beatmap_path
 
         if not current_rel or not songs_folder:
             continue
@@ -320,51 +321,82 @@ def beatmap_loader_thread():
                 raw = f.read()
             notes = parse_osu_taiko(raw)
             print(f"[Loader] Parsed {len(notes)} notes")
-            with state.lock:
-                state.notes = notes
-                state.loaded_beatmap_path = current_rel
+            state.notes = notes
+            state.loaded_beatmap_path = current_rel
+            note_times_cache[:] = [n.time_ms for n in notes]
         except FileNotFoundError:
             print(f"[Loader] File not found: {full_path}")
         except Exception as e:
             print(f"[Loader] Error: {e}")
 
 
-# ─── 色変換ヘルパー ────────────────────────────────────────
+# ─── ノーツ描画ヘルパー ──────────────────────────────────────
 
-def rgb_to_hex(r, g, b):
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-def note_color_hex(ntype: str) -> str:
-    m = {
-        "don":          COL_DON,
-        "don_big":      COL_DON_BIG,
-        "kat":          COL_KAT,
-        "kat_big":      COL_KAT_BIG,
-        "drumroll":     COL_DRUMROLL,
-        "drumroll_big": COL_DRUMROLL,
-        "spinner":      COL_SPINNER,
-    }
-    return rgb_to_hex(*m.get(ntype, COL_DON))
+def note_color(ntype: str):
+    return {
+        "don": COL_DON, "don_big": COL_DON_BIG,
+        "kat": COL_KAT, "kat_big": COL_KAT_BIG,
+        "drumroll": COL_DRUMROLL, "drumroll_big": COL_DRUMROLL,
+        "spinner": COL_SPINNER,
+    }.get(ntype, COL_DON)
 
 def note_radius(ntype: str) -> int:
     return NOTE_R_BIG if "big" in ntype else NOTE_R_SMALL
 
 
-# ─── tkinter レンダラー ─────────────────────────────────────
+def build_note_surfs() -> dict:
+    """don/kat/big をサーフェスにプリレンダ"""
+    import pygame
+    surfs = {}
+    for ntype in ("don", "don_big", "kat", "kat_big"):
+        r   = note_radius(ntype)
+        col = note_color(ntype)
+        s   = pygame.Surface((r*2+4, r*2+4), pygame.SRCALPHA)
+        pygame.draw.circle(s, col,             (r+2, r+2), r)
+        pygame.draw.circle(s, (255,255,255),   (r+2, r+2), r, 2)
+        surfs[ntype] = s
+    return surfs
+
+
+def build_static_bg(surf, W, H, LY):
+    """背景・グリッド・判定ラインを surf に描画"""
+    import pygame
+    surf.fill(COL_BG)
+    pygame.draw.rect(surf, COL_LANE,
+                     (0, LY - NOTE_R_BIG - 10, W, (NOTE_R_BIG+10)*2))
+    for dt in range(0, LOOKAHEAD_MS+1, 500):
+        gx  = HIT_CIRCLE_X + int(dt * SCROLL_SPEED)
+        col = (60,60,60) if dt % 1000 == 0 else (45,45,45)
+        pygame.draw.line(surf, col, (gx, 0), (gx, H), 1)
+    for r, w in ((NOTE_R_BIG+14, 3), (NOTE_R_SMALL+10, 2)):
+        pygame.draw.circle(surf, COL_HIT_RING, (HIT_CIRCLE_X, LY), r, w)
+
+
+# ─── pygame レンダラー ────────────────────────────────────────
 
 def run_renderer(window_w: int, window_h: int):
     global WINDOW_W, WINDOW_H, LANE_Y
+    import pygame
+    import ctypes
+    import tkinter as tk
+
+    # Windows タイマー精度 1ms
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
 
     WINDOW_W = window_w
     WINDOW_H = window_h
     LANE_Y   = window_h // 2
 
+    # ── tkinter ウィンドウ（最前面・半透明を担当）────────────
     root = tk.Tk()
     root.title("osu!taiko BeatmapView")
     root.geometry(f"{window_w}x{window_h}")
     root.resizable(True, True)
-    root.attributes("-topmost", True)   # tkinter の確実な最前面
-    root.attributes("-alpha", 220/255)  # opacity
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 220/255)
 
     # アイコン
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images.ico")
@@ -375,225 +407,129 @@ def run_renderer(window_w: int, window_h: int):
         except Exception as e:
             print(f"[BV] Icon load failed: {e}")
 
-    canvas = tk.Canvas(root, bg=rgb_to_hex(*COL_BG), highlightthickness=0)
-    canvas.pack(fill=tk.BOTH, expand=True)
+    embed = tk.Frame(root, width=window_w, height=window_h)
+    embed.pack(fill=tk.BOTH, expand=True)
+    embed.update()
+
+    # ── pygame を tkinter Frame に埋め込む（windib なし）────
+    os.environ["SDL_WINDOWID"] = str(embed.winfo_id())
+    # SDL_VIDEODRIVER は設定しない（windib を使わない）
+
+    pygame.init()
+    screen = pygame.display.set_mode((window_w, window_h))
+    clock  = pygame.time.Clock()
+
+    font_sm = pygame.font.SysFont("monospace", 18)
+    font_md = pygame.font.SysFont("monospace", 24, bold=True)
+
+    static_bg  = pygame.Surface((WINDOW_W, WINDOW_H))
+    build_static_bg(static_bg, WINDOW_W, WINDOW_H, LANE_Y)
+    note_surfs = build_note_surfs()
 
     print("[BV] Always-on-top enabled (tkinter)")
 
-    # 色定数をhex化
-    HEX_BG      = rgb_to_hex(*COL_BG)
-    HEX_LANE    = rgb_to_hex(*COL_LANE)
-    HEX_GRID1   = "#3c3c3c"
-    HEX_GRID2   = "#2d2d2d"
-    HEX_RING    = rgb_to_hex(*COL_HIT_RING)
-    HEX_TEXT    = rgb_to_hex(*COL_TEXT)
-    HEX_WARN    = rgb_to_hex(*COL_WARN)
-    HEX_OK      = "#64ff64"
-    HEX_GRAY    = "#787878"
-    HEX_WHITE   = "#ffffff"
+    # ── pygame ループ（別スレッド）───────────────────────────
+    _stop = [False]
 
-    last_frame_time = time.perf_counter()
-    fps_display = 0.0
-    prev_W, prev_H = -1, -1
-
-    # ── 再利用するcanvasアイテムのIDを保持 ──────────────────
-    # 背景・グリッド・判定ラインはリサイズ時だけ再作成
-    bg_items: list = []
-    # ノーツは譜面ロード時に全て事前作成、coords()で位置だけ更新
-    note_items: list = []   # (note_index, item_ids...)のリスト
-    note_cache_key = None   # notes が変わったか検出用
-    active_prev: set = set()  # 前フレームの表示中インデックス
-    note_times: list = []     # 二分探索用タイムスタンプキャッシュ
-
-    # UIテキストは起動時に1回作成してconfigure/coordsで更新
-    id_state_text = canvas.create_text(10, 10, text="", fill=HEX_OK,
-                                       font=("Courier", 14, "bold"), anchor="nw")
-    id_mod_text   = canvas.create_text(130, 10, text="", fill=HEX_TEXT,
-                                       font=("Courier", 14, "bold"), anchor="nw")
-    id_time_text  = canvas.create_text(10, 10, text="", fill=HEX_TEXT,
-                                       font=("Courier", 12), anchor="ne")
-    id_fps_text   = canvas.create_text(10, 10, text="", fill=HEX_GRAY,
-                                       font=("Courier", 11), anchor="sw")
-
-    def build_bg(W, H, LY):
-        """背景・グリッド・判定ラインを再描画（リサイズ時のみ呼ぶ）"""
-        for iid in bg_items:
-            canvas.delete(iid)
-        bg_items.clear()
-
-        bg_items.append(canvas.create_rectangle(
-            0, LY - NOTE_R_BIG - 10, W, LY + NOTE_R_BIG + 10,
-            fill=HEX_LANE, outline=""))
-
-        for dtt in range(0, LOOKAHEAD_MS + 1, 500):
-            gx  = HIT_CIRCLE_X + int(dtt * SCROLL_SPEED)
-            col = HEX_GRID1 if dtt % 1000 == 0 else HEX_GRID2
-            bg_items.append(canvas.create_line(gx, 0, gx, H, fill=col))
-
-        for r, w in ((NOTE_R_BIG + 14, 3), (NOTE_R_SMALL + 10, 2)):
-            bg_items.append(canvas.create_oval(
-                HIT_CIRCLE_X - r, LY - r, HIT_CIRCLE_X + r, LY + r,
-                outline=HEX_RING, width=w))
-
-        # UIアイテムを最前面に
-        for iid in (id_state_text, id_mod_text, id_time_text, id_fps_text):
-            canvas.tag_raise(iid)
-
-    def build_note_items(notes, LY):
-        """ノーツのcanvasアイテムを事前作成（譜面変更時のみ呼ぶ）"""
-        for ids in note_items:
-            for iid in ids:
-                canvas.delete(iid)
-        note_items.clear()
-
-        for note in notes:
-            col = note_color_hex(note.note_type)
-            r   = note_radius(note.note_type)
-
-            if note.note_type in ("drumroll", "drumroll_big"):
-                i0 = canvas.create_rectangle(0, 0, 1, 1, fill=col, outline="", state="hidden")
-                i1 = canvas.create_oval(0, 0, 1, 1, fill=col, outline="", state="hidden")
-                i2 = canvas.create_oval(0, 0, 1, 1, fill=col, outline="", state="hidden")
-                note_items.append((i0, i1, i2))
-            elif note.note_type == "spinner":
-                i0 = canvas.create_rectangle(0, 0, 1, 1, fill=col, outline="", state="hidden")
-                i1 = canvas.create_oval(0, 0, 1, 1, outline=col, width=4, state="hidden")
-                i2 = canvas.create_oval(0, 0, 1, 1, outline=col, width=4, state="hidden")
-                note_items.append((i0, i1, i2))
-            else:
-                i0 = canvas.create_oval(0, 0, 1, 1, fill=col, outline=HEX_WHITE, width=2, state="hidden")
-                note_items.append((i0,))
-
-        # UIアイテムを最前面に
-        for iid in (id_state_text, id_mod_text, id_time_text, id_fps_text):
-            canvas.tag_raise(iid)
-
-    def draw():
-        nonlocal last_frame_time, fps_display, prev_W, prev_H, note_cache_key, active_prev, note_times
+    def pygame_loop():
         global WINDOW_W, WINDOW_H, LANE_Y
+        nonlocal static_bg
 
-        now = time.perf_counter()
-        dt_frame = now - last_frame_time
-        last_frame_time = now
-        if dt_frame > 0:
-            fps_display = fps_display * 0.9 + (1.0 / dt_frame) * 0.1
+        while not _stop[0]:
+            # リサイズ検出（set_mode は呼ばず Surface だけ作り直す）
+            W = embed.winfo_width()
+            H = embed.winfo_height()
+            if W > 1 and H > 1 and (W != WINDOW_W or H != WINDOW_H):
+                WINDOW_W = W
+                WINDOW_H = H
+                LANE_Y   = H // 2
+                static_bg = pygame.Surface((W, H))
+                build_static_bg(static_bg, W, H, LANE_Y)
 
-        W = canvas.winfo_width()
-        H = canvas.winfo_height()
-        if W < 2 or H < 2:
-            root.after(0, draw)
-            return
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    _stop[0] = True
 
-        WINDOW_W = W
-        WINDOW_H = H
-        LANE_Y   = H // 2
-
-        # リサイズ検出 → 背景再構築
-        if W != prev_W or H != prev_H:
-            build_bg(W, H, LANE_Y)
-            prev_W, prev_H = W, H
-
-        # 状態取得
-        with state.lock:
-            game_state = state.state_name
-            notes_snap = state.notes      # 参照のみ（コピーしない）
-            mod_label  = state.mod_label
-            current_ms = state.game_time_ms
-
-        # 譜面変更検出 → ノーツアイテム再構築
-        ck = id(notes_snap)
-        if ck != note_cache_key:
-            build_note_items(notes_snap, LANE_Y)
-            note_times = [n.time_ms for n in notes_snap]
-            note_cache_key = ck
-            active_prev.clear()
-
-        # ノーツ位置更新（表示範囲内のみ処理・差分で hide）
-        lo = bisect.bisect_left(note_times, current_ms - 500)
-        hi = bisect.bisect_right(note_times, current_ms + LOOKAHEAD_MS)
-        active_now = set(range(lo, min(hi, len(note_items))))
-
-        # 前フレームから消えた分だけ hidden にする
-        for idx in (active_prev - active_now):
-            if idx < len(note_items):
-                for iid in note_items[idx]:
-                    canvas.itemconfigure(iid, state="hidden")
-        active_prev.clear()
-        active_prev.update(active_now)
-
-        for idx in active_now:
-            ids = note_items[idx]
-            note = notes_snap[idx]
-            dtt = note.time_ms - current_ms
-
-            nx = HIT_CIRCLE_X + int(dtt * SCROLL_SPEED)
-            r  = note_radius(note.note_type)
-
-            if note.note_type in ("drumroll", "drumroll_big"):
-                end_dtt = note.end_time_ms - current_ms
-                # ドラムロールは終端が判定ラインを過ぎたら消す
-                if end_dtt < 0 or dtt > LOOKAHEAD_MS:
-                    for iid in ids:
-                        canvas.itemconfigure(iid, state="hidden")
-                    continue
-                ex  = HIT_CIRCLE_X + int(end_dtt * SCROLL_SPEED)
-                bar_y = LANE_Y - r // 2
-                canvas.coords(ids[0], nx, bar_y, max(ex, nx+4), bar_y + r)
-                canvas.coords(ids[1], nx-r, LANE_Y-r, nx+r, LANE_Y+r)
-                canvas.coords(ids[2], ex-r, LANE_Y-r, ex+r, LANE_Y+r)
-                for iid in ids:
-                    canvas.itemconfigure(iid, state="normal")
-
-            elif note.note_type == "spinner":
-                end_dtt = note.end_time_ms - current_ms
-                # スピナーも終端が判定ラインを過ぎたら消す
-                if end_dtt < 0 or dtt > LOOKAHEAD_MS:
-                    for iid in ids:
-                        canvas.itemconfigure(iid, state="hidden")
-                    continue
-                ex  = HIT_CIRCLE_X + int(end_dtt * SCROLL_SPEED)
-                sr  = NOTE_R_SMALL + 6
-                canvas.coords(ids[0], nx, LANE_Y-6, max(ex, nx+4), LANE_Y+6)
-                canvas.coords(ids[1], nx-sr, LANE_Y-sr, nx+sr, LANE_Y+sr)
-                canvas.coords(ids[2], ex-sr, LANE_Y-sr, ex+sr, LANE_Y+sr)
-                for iid in ids:
-                    canvas.itemconfigure(iid, state="normal")
-
+            # 時刻補間
+            interp_wall  = state.interp_wall
+            interp_game  = state.interp_game
+            interp_speed = state.interp_speed
+            if interp_wall > 0:
+                elapsed    = (time.perf_counter() - interp_wall) * 1000
+                current_ms = int(interp_game + elapsed * interp_speed)
             else:
-                # 通常ノーツは判定ラインに到達（dtt<=0）でスパッと消す
-                if dtt < 0 or dtt > LOOKAHEAD_MS:
-                    for iid in ids:
-                        canvas.itemconfigure(iid, state="hidden")
-                    continue
-                canvas.coords(ids[0], nx-r, LANE_Y-r, nx+r, LANE_Y+r)
-                canvas.itemconfigure(ids[0], state="normal")
+                current_ms = state.game_time_ms
 
-        # UIテキスト更新（configure のみ）
-        state_col = HEX_OK if game_state == "Playing" else HEX_WARN
-        canvas.itemconfigure(id_state_text, text=game_state, fill=state_col)
-        canvas.coords(id_state_text, 10, 10)
+            game_state = state.state_name
+            notes_snap = state.notes
+            mod_label  = state.mod_label
 
-        if mod_label:
-            mod_col = {"DT": "#ffc832", "NC": "#ffa050", "HT": "#50b4ff"}.get(mod_label, HEX_TEXT)
-            canvas.itemconfigure(id_mod_text, text=mod_label, fill=mod_col)
-            canvas.coords(id_mod_text, 10 + len(game_state) * 10 + 12, 10)
-        else:
-            canvas.itemconfigure(id_mod_text, text="")
+            # 描画
+            screen.blit(static_bg, (0, 0))
 
-        mins = current_ms // 60000
-        secs = (current_ms % 60000) // 1000
-        ms   = current_ms % 1000
-        canvas.itemconfigure(id_time_text, text=f"{mins:02d}:{secs:02d}.{ms:03d}")
-        canvas.coords(id_time_text, W - 10, 10)
+            lo = bisect.bisect_left(note_times_cache, current_ms)
+            hi = bisect.bisect_right(note_times_cache, current_ms + LOOKAHEAD_MS)
 
-        canvas.itemconfigure(id_fps_text, text=f"{fps_display:.0f}fps")
-        canvas.coords(id_fps_text, 10, H - 8)
+            for i in range(lo, min(hi, len(notes_snap))):
+                note = notes_snap[i]
+                dtt  = note.time_ms - current_ms
+                nx   = HIT_CIRCLE_X + int(dtt * SCROLL_SPEED)
+                r    = note_radius(note.note_type)
+                col  = note_color(note.note_type)
 
-        root.after(8, draw)   # ~120fps（UIスレッドを占領しない）
+                if note.note_type in ("drumroll", "drumroll_big"):
+                    end_dtt = note.end_time_ms - current_ms
+                    if end_dtt < 0:
+                        continue
+                    ex    = HIT_CIRCLE_X + int(end_dtt * SCROLL_SPEED)
+                    bar_y = LANE_Y - r // 2
+                    pygame.draw.rect(screen, col, (nx, bar_y, max(ex-nx, 4), r))
+                    pygame.draw.circle(screen, col, (nx, LANE_Y), r)
+                    pygame.draw.circle(screen, col, (ex, LANE_Y), r)
+                elif note.note_type == "spinner":
+                    end_dtt = note.end_time_ms - current_ms
+                    if end_dtt < 0:
+                        continue
+                    ex = HIT_CIRCLE_X + int(end_dtt * SCROLL_SPEED)
+                    pygame.draw.rect(screen, col, (nx, LANE_Y-6, max(ex-nx, 4), 12))
+                    for cx in (nx, ex):
+                        pygame.draw.circle(screen, col, (cx, LANE_Y), NOTE_R_SMALL+6, 4)
+                else:
+                    if dtt < 0:
+                        continue
+                    s = note_surfs.get(note.note_type)
+                    if s:
+                        screen.blit(s, (nx - r - 2, LANE_Y - r - 2))
 
-    root.bind("<Escape>", lambda e: root.destroy())
-    root.after(16, draw)
+            fps       = clock.get_fps()
+            state_col = (100,255,100) if game_state == "Playing" else COL_WARN
+            screen.blit(font_md.render(game_state, True, state_col), (10, 10))
+            if mod_label:
+                mc = {"DT":(255,200,50),"NC":(255,160,80),"HT":(80,180,255)}.get(mod_label, COL_TEXT)
+                screen.blit(font_md.render(mod_label, True, mc), (160, 10))
+            mins = current_ms // 60000
+            secs = (current_ms % 60000) // 1000
+            ms   = current_ms % 1000
+            t_surf = font_sm.render(f"{mins:02d}:{secs:02d}.{ms:03d}", True, COL_TEXT)
+            screen.blit(t_surf, (WINDOW_W - t_surf.get_width() - 10, 10))
+            fps_surf = font_sm.render(f"{fps:.0f}fps", True, (120,120,120))
+            screen.blit(fps_surf, (10, WINDOW_H - fps_surf.get_height() - 6))
+
+            pygame.display.flip()
+            clock.tick_busy_loop(FPS)
+
+        pygame.quit()
+
+    pg_thread = threading.Thread(target=pygame_loop, daemon=True)
+    pg_thread.start()
+
+    root.bind("<Escape>", lambda e: (root.destroy(), _stop.__setitem__(0, True)))
     root.mainloop()
+    _stop[0] = True
+
+
+# note_times キャッシュ（bisect用、beatmap_loader_thread が更新）
+note_times_cache: list = []
 
 # ─── エントリーポイント ───────────────────────────────────
 
