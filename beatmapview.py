@@ -41,7 +41,7 @@ TOSU_WS_URL        = "ws://127.0.0.1:24050/websocket/v2"
 TOSU_WS_PRECISE    = "ws://127.0.0.1:24050/websocket/v2/precise"
 
 WINDOW_W, WINDOW_H = 1280, 360
-FPS = 240          # 高FPSでスクロールを滑らかに
+FPS = 240
 
 # Taiko ノーツ見た目
 HIT_CIRCLE_X  = 200          # 判定ライン X 座標
@@ -66,7 +66,7 @@ NOTE_R_SMALL   = 28
 NOTE_R_BIG     = 40
 LANE_Y         = WINDOW_H // 2
 
-# ─── osu!ファイルパーサー ────────────────────────────────
+# ─── beatmap parser────────────────────────────────
 
 @dataclass
 class TaikoNote:
@@ -76,8 +76,7 @@ class TaikoNote:
 
 def parse_osu_taiko(content: str) -> list[TaikoNote]:
     """
-    .osu ファイルの [HitObjects] セクションを Taiko として解析する。
-    osu! の Taiko ノーツ変換ルールに従う。
+    osuのTaiko ノーツ変換ルールに従う。
     """
     notes: list[TaikoNote] = []
     in_hit_objects = False
@@ -141,8 +140,6 @@ def parse_osu_taiko(content: str) -> list[TaikoNote]:
 
 def _fix_drumroll_endtimes(notes: list[TaikoNote], content: str) -> list[TaikoNote]:
     """
-    .osu の TimingPoints から SliderMultiplier / BPM を読んで
-    ドラムロール end_time を正確に計算する（オプション強化）。
     sv 1.0 なら length * beat_duration、sv 0.5 なら length * beat_duration * 0.5 など。
     本格対応は必要に応じて拡張してください。
     """
@@ -214,7 +211,7 @@ def on_message(ws, message):
             state.play_start_wall = time.perf_counter()
             state.play_start_game = data.get("beatmap", {}).get("time", {}).get("live", 0)
             state.playing = True
-            print(f"[DS] Play start! mods={state.mod_label or 'NoMod'} "
+            print(f"[BV] Play start! mods={state.mod_label or 'NoMod'} "
                   f"speed={state.speed_rate}x game_time={state.play_start_game}ms")
 
         if new_state_name != "Playing":
@@ -370,14 +367,14 @@ def run_renderer(window_w: int, window_h: int):
     if os.path.exists(icon_path):
         try:
             root.iconbitmap(icon_path)
-            print("[DS] Icon loaded")
+            print("[BV] Icon loaded")
         except Exception as e:
-            print(f"[DS] Icon load failed: {e}")
+            print(f"[BV] Icon load failed: {e}")
 
     canvas = tk.Canvas(root, bg=rgb_to_hex(*COL_BG), highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    print("[DS] Always-on-top enabled (tkinter)")
+    print("[BV] Always-on-top enabled (tkinter)")
 
     # 色定数をhex化
     HEX_BG      = rgb_to_hex(*COL_BG)
@@ -608,4 +605,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
