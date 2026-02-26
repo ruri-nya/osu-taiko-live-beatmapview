@@ -12,6 +12,7 @@ import tkinter as tk
 from dataclasses import dataclass, field
 from typing import Optional
 
+import bisect
 import websocket
 
 # ─── Mod ビットフラグ (osu! 標準) ──────────────────────
@@ -41,11 +42,11 @@ TOSU_WS_URL        = "ws://127.0.0.1:24050/websocket/v2"
 TOSU_WS_PRECISE    = "ws://127.0.0.1:24050/websocket/v2/precise"
 
 WINDOW_W, WINDOW_H = 1280, 360
-FPS = 240
+FPS = 240          # 高FPSでスクロールを滑らかに
 
 # Taiko ノーツ見た目
 HIT_CIRCLE_X  = 200          # 判定ライン X 座標
-SCROLL_SPEED   = 0.8        # px/ms (BPMや速度によらず固定。後でSV対応可)
+SCROLL_SPEED   = 0.65        # px/ms (BPMや速度によらず固定。後でSV対応可)
 LOOKAHEAD_MS   = 4000        # 右端に何ms先を表示するか
 
 # 色
@@ -66,7 +67,7 @@ NOTE_R_SMALL   = 28
 NOTE_R_BIG     = 40
 LANE_Y         = WINDOW_H // 2
 
-# ─── beatmap parser────────────────────────────────
+# ─── osu!ファイルパーサー ────────────────────────────────
 
 @dataclass
 class TaikoNote:
@@ -76,7 +77,8 @@ class TaikoNote:
 
 def parse_osu_taiko(content: str) -> list[TaikoNote]:
     """
-    osuのTaiko ノーツ変換ルールに従う。
+    .osu ファイルの [HitObjects] セクションを Taiko として解析する。
+    osu! の Taiko ノーツ変換ルールに従う。
     """
     notes: list[TaikoNote] = []
     in_hit_objects = False
@@ -140,6 +142,8 @@ def parse_osu_taiko(content: str) -> list[TaikoNote]:
 
 def _fix_drumroll_endtimes(notes: list[TaikoNote], content: str) -> list[TaikoNote]:
     """
+    .osu の TimingPoints から SliderMultiplier / BPM を読んで
+    ドラムロール end_time を正確に計算する（オプション強化）。
     sv 1.0 なら length * beat_duration、sv 0.5 なら length * beat_duration * 0.5 など。
     本格対応は必要に応じて拡張してください。
     """
@@ -398,6 +402,8 @@ def run_renderer(window_w: int, window_h: int):
     # ノーツは譜面ロード時に全て事前作成、coords()で位置だけ更新
     note_items: list = []   # (note_index, item_ids...)のリスト
     note_cache_key = None   # notes が変わったか検出用
+    active_prev: set = set()  # 前フレームの表示中インデックス
+    note_times: list = []     # 二分探索用タイムスタンプキャッシュ
 
     # UIテキストは起動時に1回作成してconfigure/coordsで更新
     id_state_text = canvas.create_text(10, 10, text="", fill=HEX_OK,
@@ -463,7 +469,7 @@ def run_renderer(window_w: int, window_h: int):
             canvas.tag_raise(iid)
 
     def draw():
-        nonlocal last_frame_time, fps_display, prev_W, prev_H, note_cache_key
+        nonlocal last_frame_time, fps_display, prev_W, prev_H, note_cache_key, active_prev, note_times
         global WINDOW_W, WINDOW_H, LANE_Y
 
         now = time.perf_counter()
@@ -498,13 +504,26 @@ def run_renderer(window_w: int, window_h: int):
         ck = id(notes_snap)
         if ck != note_cache_key:
             build_note_items(notes_snap, LANE_Y)
+            note_times = [n.time_ms for n in notes_snap]
             note_cache_key = ck
+            active_prev.clear()
 
-        # ノーツ位置更新（coords のみ、作成なし）
-        for idx, note in enumerate(notes_snap):
-            if idx >= len(note_items):
-                break
+        # ノーツ位置更新（表示範囲内のみ処理・差分で hide）
+        lo = bisect.bisect_left(note_times, current_ms - 500)
+        hi = bisect.bisect_right(note_times, current_ms + LOOKAHEAD_MS)
+        active_now = set(range(lo, min(hi, len(note_items))))
+
+        # 前フレームから消えた分だけ hidden にする
+        for idx in (active_prev - active_now):
+            if idx < len(note_items):
+                for iid in note_items[idx]:
+                    canvas.itemconfigure(iid, state="hidden")
+        active_prev.clear()
+        active_prev.update(active_now)
+
+        for idx in active_now:
             ids = note_items[idx]
+            note = notes_snap[idx]
             dtt = note.time_ms - current_ms
 
             nx = HIT_CIRCLE_X + int(dtt * SCROLL_SPEED)
@@ -570,7 +589,7 @@ def run_renderer(window_w: int, window_h: int):
         canvas.itemconfigure(id_fps_text, text=f"{fps_display:.0f}fps")
         canvas.coords(id_fps_text, 10, H - 8)
 
-        root.after(4, draw)   # ~120fps（UIスレッドを占領しない）
+        root.after(8, draw)   # ~120fps（UIスレッドを占領しない）
 
     root.bind("<Escape>", lambda e: root.destroy())
     root.after(16, draw)
@@ -605,5 +624,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
