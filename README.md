@@ -3,7 +3,7 @@
 osu!taiko用のリアルタイム譜面ビューアです。  
 [tosu](https://github.com/tosu/tosu) の WebSocket API を使ってゲームの状態を読み取り、別ウィンドウにノーツをスクロール表示します。
 
-![](https://i.ibb.co/tpKNgz7Y/image.png)
+![](https://i.ibb.co/d4M3Ftdk/image.png)
 
 ---
 
