@@ -1,7 +1,7 @@
 # osu!taiko Live View
 
 osu!taiko用のリアルタイム譜面ビューアです。  
-[tosu](https://github.com/tosu/tosu) の WebSocket API を使ってゲームの状態を読み取り、別ウィンドウにノーツをスクロール表示します。
+[tosu](https://github.com/tosuapp/tosu) の WebSocket API を使ってゲームの状態を読み取り、別ウィンドウにノーツをスクロール表示します。
 
 ![](https://i.ibb.co/d4M3Ftdk/image.png)
 
@@ -11,7 +11,7 @@ osu!taiko用のリアルタイム譜面ビューアです。
 
 - Windows 10/11
 - Python 3.10 以上
-- [tosu](https://github.com/tosu/tosu)（osu! のメモリリーダー）
+- [tosu](https://github.com/tosuapp/tosu)（osu! のメモリリーダー）
 
 ---
 
